@@ -27,6 +27,8 @@ BACKUP = ROOT / "build" / "trollstore" / "backup"
 MAINTAB = ROOT / "LemonMusic" / "UI" / "MainTabView.swift"
 CARPLAY = ROOT / "LemonMusic" / "CarPlay" / "CarPlayCoordinator.swift"
 COLLECTION = ROOT / "LemonMusic" / "UI" / "CollectionDetailView.swift"
+WIDGETS = ROOT / "LemonMusicWidgets" / "LemonMusicWidgets.swift"
+PLAYER = ROOT / "LemonMusic" / "UI" / "PlayerViews.swift"
 PBX = ROOT / "LemonMusic.xcodeproj" / "project.pbxproj"
 
 # 不含任何 iOS 18+ 符号的完整替代实现。
@@ -147,6 +149,9 @@ FORBIDDEN = [
     (r"\.tabViewBottomAccessory\b", "iOS 26 的 .tabViewBottomAccessory"),
     (r"tabViewBottomAccessoryPlacement", "iOS 26 的 tabViewBottomAccessoryPlacement"),
     (r"showsSpinnerWhileEmpty", "iOS 18.4 的 showsSpinnerWhileEmpty"),
+    (r"\.widgetAccentedRenderingMode\b", "iOS 18.0 的 widgetAccentedRenderingMode"),
+    (r"\.onGeometryChange\b", "iOS 18.0 的 onGeometryChange"),
+    (r"\.help\(", "SwiftUI .help(...) 修饰符"),
 ]
 
 
@@ -201,6 +206,52 @@ def patch_help() -> str:
     return "CollectionDetailView: 已移除 .help(...) 修饰符"
 
 
+def patch_widget() -> str:
+    if not WIDGETS.exists():
+        return "LemonMusicWidgets: 文件不存在，跳过"
+    s = WIDGETS.read_text(encoding="utf-8")
+    if ".widgetAccentedRenderingMode" not in s:
+        return "LemonMusicWidgets: 已兼容，跳过"
+    backup(WIDGETS)
+    s = re.sub(r"^([^\n]*)\.widgetAccentedRenderingMode\([^)]*\)([^\n]*)$",
+               lambda m: m.group(1) + m.group(2), s, flags=re.M)
+    WIDGETS.write_text(s, encoding="utf-8")
+    return "LemonMusicWidgets: 已移除 iOS 18 的 widgetAccentedRenderingMode"
+
+
+GEO_OLD = "        .onGeometryChange(for: CGRect.self, of: { $0.frame(in: .global) }) { progressFrame = $0 }\n"
+GEO_NEW = """        .background {
+            GeometryReader { proxy in
+                Color.clear.preference(key: ProgressFramePreferenceKey.self,
+                                       value: proxy.frame(in: .global))
+            }
+        }
+        .onPreferenceChange(ProgressFramePreferenceKey.self) { progressFrame = $0 }
+"""
+GEO_KEY = """private struct ProgressFramePreferenceKey: PreferenceKey {
+    static let defaultValue: CGRect = .zero
+    static func reduce(value: inout CGRect, nextValue: () -> CGRect) {
+        value = nextValue()
+    }
+}
+
+"""
+
+
+def patch_player() -> str:
+    if not PLAYER.exists():
+        return "PlayerViews: 文件不存在，跳过"
+    s = PLAYER.read_text(encoding="utf-8")
+    if not code_has(s, r"\.onGeometryChange\b"):
+        return "PlayerViews: 已兼容，跳过"
+    backup(PLAYER)
+    if "ProgressFramePreferenceKey" not in s:
+        s = s.replace("import SwiftUI\n\n", "import SwiftUI\n\n" + GEO_KEY, 1)
+    s = s.replace(GEO_OLD, GEO_NEW, 1)
+    PLAYER.write_text(s, encoding="utf-8")
+    return "PlayerViews: onGeometryChange -> GeometryReader + PreferenceKey"
+
+
 def patch_pbx() -> str:
     s = PBX.read_text(encoding="utf-8")
     if "IPHONEOS_DEPLOYMENT_TARGET = 18.0;" not in s:
@@ -228,7 +279,7 @@ def verify() -> list[str]:
 
 
 def main() -> int:
-    for fn in (patch_maintab, patch_carplay, patch_help, patch_pbx):
+    for fn in (patch_maintab, patch_carplay, patch_help, patch_widget, patch_player, patch_pbx):
         print("ios17_compat:", fn())
     problems = verify()
     if problems:

@@ -2,6 +2,15 @@
 
 import SwiftUI
 
+// iOS 17 兼容：用 PreferenceKey + GeometryReader 取代 iOS 18 才有的
+// .onGeometryChange(for:of:action:)，读取进度条在全局坐标系里的 frame。
+private struct ProgressFramePreferenceKey: PreferenceKey {
+    static let defaultValue: CGRect = .zero
+    static func reduce(value: inout CGRect, nextValue: () -> CGRect) {
+        value = nextValue()
+    }
+}
+
 enum MiniPlayerPresentation {
     case legacy
     case expandedAccessory
@@ -243,14 +252,24 @@ struct FullPlayerView: View {
                 HStack(alignment: .top, spacing: 8) {
                     Text(error).font(.caption).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
                     Spacer(minLength: 0)
-                    Button("重试", systemImage: "arrow.clockwise") { model.playback.resume() }
+                    Button {
+                        model.playback.resume()
+                    } label: {
+                        Label("重试", systemImage: "arrow.clockwise")
+                    }
                         .font(.caption)
                         .accessibilityIdentifier("player.retry")
                 }
                 .accessibilityIdentifier("player.error")
             }
         }
-        .onGeometryChange(for: CGRect.self, of: { $0.frame(in: .global) }) { progressFrame = $0 }
+        .background {
+            GeometryReader { proxy in
+                Color.clear.preference(key: ProgressFramePreferenceKey.self,
+                                       value: proxy.frame(in: .global))
+            }
+        }
+        .onPreferenceChange(ProgressFramePreferenceKey.self) { progressFrame = $0 }
     }
 
     private var controls: some View {

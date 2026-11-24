@@ -121,7 +121,9 @@ struct PlaybackWidgetView: View {
         ZStack {
             Color.primary.opacity(0.05)
             if let image = entry.artwork {
-                Image(uiImage: image).resizable().widgetAccentedRenderingMode(.fullColor).scaledToFill()
+                // iOS 17 兼容：widgetAccentedRenderingMode 是 iOS 18.0 才有的修饰符，
+                // 低版本部署目标下直接引用会编译失败；原样显示封面即可。
+                Image(uiImage: image).resizable().scaledToFill()
             } else {
                 Image(systemName: "music.note").font(.system(size: size * 0.35, weight: .medium)).foregroundStyle(orange)
             }
