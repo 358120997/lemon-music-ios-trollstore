@@ -219,18 +219,33 @@ def prepare_repo(token: str, repo_full: str) -> None:
     auth = base64.b64encode(("x-access-token:" + token).encode()).decode()
     # Windows 的 schannel 在离线/被代理环境下会报 CRYPT_E_REVOCATION_OFFLINE，
     # 切到 OpenSSL 后端并关闭吊销检查；非 Windows 上这两个配置会被安全忽略。
-    r = subprocess.run(
-        ["git", "-C", str(ROOT),
-         "-c", "http.sslBackend=openssl",
-         "-c", "http.schannelCheckRevoke=false",
-         "-c", f"http.extraHeader=Authorization: Basic {auth}",
-         "push", "-u", "origin", "main"],
-        capture_output=True, text=True, encoding="utf-8", errors="replace")
-    if r.returncode:
-        out = (r.stdout or "") + (r.stderr or "")
-        out = out.replace(token, "***")  # 双保险，不把令牌打出来
-        raise RuntimeError("推送失败: " + out[-800:])
-    print("推送完成:", repo_full)
+    # GitHub + 本机代理链上 HTTP/2 常被中间设备重置，表现为
+    # "RPC failed; curl 55 Recv failure: Connection was reset"。强制 HTTP/1.1
+    # 并放大 postBuffer，再配合重试；push 是增量的，失败重跑不会重复传大对象。
+    push_cmd = [
+        "git", "-C", str(ROOT),
+        "-c", "http.sslBackend=openssl",
+        "-c", "http.schannelCheckRevoke=false",
+        "-c", "http.version=HTTP/1.1",
+        "-c", "http.postBuffer=524288000",
+        "-c", "http.lowSpeedLimit=0",
+        "-c", "http.lowSpeedTime=999999",
+        "-c", f"http.extraHeader=Authorization: Basic {auth}",
+        "push", "-u", "origin", "main",
+    ]
+    last = ""
+    for attempt in range(1, 4):
+        r = subprocess.run(push_cmd, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace")
+        if not r.returncode:
+            print("推送完成:", repo_full)
+            return
+        last = (r.stdout or "") + (r.stderr or "")
+        tail = last.strip().splitlines()[-1] if last.strip() else "unknown"
+        print("push 第 %d 次失败: %s —— 重试" % (attempt, tail[:140]), file=sys.stderr)
+        time.sleep(5)
+    last = last.replace(token, "***")  # 双保险，不把令牌打出来
+    raise RuntimeError("推送失败: " + last[-800:])
 
 
 def main() -> int:
