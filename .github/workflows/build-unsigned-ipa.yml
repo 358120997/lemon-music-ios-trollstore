@@ -1,0 +1,56 @@
+name: Build LemonMusic IPA
+
+# 在 fork 后的仓库里：Actions -> Build LemonMusic IPA -> Run workflow
+# 产出未签名的 IPA（仅供 TrollStore / 越狱设备，或用 Sideloadly、AltStore、ios-app-signer 自行重签）。
+# 公开仓库的 macOS runner 对免费账号可用，但 macOS 分钟按倍率计费，单次构建约 10-20 分钟额度。
+on:
+  workflow_dispatch:
+    inputs:
+      strip_appgroup:
+        description: "同时移除 App Group entitlement（重签时没有付费开发者账号就选 true）"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+jobs:
+  build-unsigned-ipa:
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select newest Xcode
+        run: |
+          XCODE="$(ls -d /Applications/Xcode*.app | sort -V | tail -n 1)"
+          echo "Using $XCODE"
+          sudo xcode-select -s "$XCODE/Contents/Developer"
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Strip author signing config, remove CarPlay entitlement, archive
+        run: |
+          chmod +x scripts/prepare-sideload.sh
+          if [ "${{ inputs.strip_appgroup }}" = "true" ]; then
+            bash scripts/prepare-sideload.sh --unsigned --strip-appgroup --out "$PWD/build/output"
+          else
+            bash scripts/prepare-sideload.sh --unsigned --out "$PWD/build/output"
+          fi
+
+      - name: Verify artifact
+        run: |
+          IPA="$PWD/build/output/LemonMusic.ipa"
+          test -f "$IPA"
+          ls -lh "$IPA"
+          unzip -l "$IPA" | head -20
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: LemonMusic-unsigned-ipa
+          path: build/output/LemonMusic.ipa
+          if-no-files-found: error
+          retention-days: 30

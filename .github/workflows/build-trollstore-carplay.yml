@@ -1,0 +1,88 @@
+name: Build LemonMusic TrollStore CarPlay IPA
+
+# 越狱 / TrollStore 专用：保留 com.apple.developer.carplay-audio + CarPlay scene，
+# CODE_SIGNING_ALLOWED=NO 归档后用 ldid 预签，TrollStore 安装时保留任意 entitlements。
+# 只有 workflow_dispatch，没有 push 触发 —— 避免同一份代码跑两遍白烧 macOS 分钟。
+#
+# 本机一条命令：python tools/cloud_build_lemon.py --public
+# 公开仓库的 macOS runner 对免费账号免费；私有仓库 Free 计划约 200 分钟/月（macOS 10x 计费）。
+on:
+  workflow_dispatch:
+    inputs:
+      min_ios:
+        description: "最低 iOS 版本（你的越狱设备版本；原工程是 18.0）"
+        required: false
+        default: "17.1"
+        type: string
+      bundle_id:
+        description: "主 App Bundle ID"
+        required: false
+        default: "com.example.lemonmusic"
+        type: string
+      add_app_id:
+        description: "额外注入 application-identifier / team-identifier（默认关）"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          swift --version
+
+      - name: Install ldid
+        run: |
+          if ! command -v ldid >/dev/null 2>&1; then
+            brew install ldid
+          fi
+          ldid 2>&1 | head -3 || true
+
+      - name: Build CarPlay-preserving TrollStore IPA
+        run: |
+          mkdir -p build
+          set -o pipefail
+          EXTRA=""
+          if [ "${{ inputs.add_app_id }}" = "true" ]; then EXTRA="--add-app-id"; fi
+          bash scripts/build-trollstore-carplay.sh \
+            --min-ios "${{ inputs.min_ios }}" \
+            --bundle "${{ inputs.bundle_id }}" \
+            $EXTRA 2>&1 | tee build/trollstore-build.log
+
+      - name: Inspect IPA
+        run: |
+          IPA="build/trollstore/LemonMusic.trollstore.carplay.ipa"
+          test -f "$IPA"
+          ls -lh "$IPA"
+          shasum -a 256 "$IPA"
+          unzip -l "$IPA" | grep -E 'LemonMusic.app/(Info.plist|LemonMusic)|PlugIns/.*appex' | head -10
+          echo "---- ldid entitlements ----"
+          cat build/trollstore/signed-entitlements.plist
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-build-log
+          path: build/trollstore-build.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: LemonMusic-trollstore-carplay-ipa
+          path: build/trollstore/LemonMusic.trollstore.carplay.ipa
+          if-no-files-found: error
+          retention-days: 30

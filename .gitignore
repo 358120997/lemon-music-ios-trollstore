@@ -1,0 +1,32 @@
+APP_FEEDBACK.md
+WARNINGS_AUDIT.md
+Beta_FEEDBACK.md
+INVESTIGATION_scrubber_drift.md
+INVESTIGATION_amperfy_comparison.md
+CACHE_AUDIT.md
+xcuserdata/
+*.xcuserstate
+build/
+
+# 云构建产物（IPA / Actions 日志 / 本地 Python 缓存）不进仓库，
+# 否则 git push 会把几十 MB 的 IPA 传上去，且下一轮会被当成源码提交。
+out/
+__pycache__/
+*.pyc
+
+# Swift package checkouts. CI builds with `-clonedSourcePackagesDirPath .spm`, so running the
+# CI command locally drops several thousand files here; without this, `git status` is unusable.
+.spm/
+.personal-signing.env
+.personal-signing-backup/
+
+# graphify — generated locally, not versioned. graphify's own README suggests committing
+# graphify-out/, but its post-commit hook rebuilds the graph after every commit, and a rebuild
+# rewrites graph.json wholesale: ~95k changed lines on top of each feature commit. The graph is
+# cheap to regenerate (`/graphify`) and worthless as history, so it stays out of the repo.
+graphify-out/
+
+# macOS
+.DS_Store
+/*/.DS_Store
+/*/*/.DS_Store

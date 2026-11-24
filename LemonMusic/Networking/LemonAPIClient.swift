@@ -1,0 +1,510 @@
+// Derived from Cassette, licensed under MPL-2.0.
+
+import Foundation
+import ImageIO
+
+actor LemonAPIClient {
+    enum APIError: LocalizedError, Sendable {
+        case invalidServer
+        case unauthorized
+        case server(status: Int, message: String)
+        case invalidResponse
+
+        var errorDescription: String? {
+            switch self {
+            case .invalidServer: "服务器地址无效"
+            case .unauthorized: "登录已失效，请重新登录"
+            case .server(_, let message): message
+            case .invalidResponse: "服务器响应格式不正确"
+            }
+        }
+    }
+
+    private let session: URLSession
+    private var baseURL: URL?
+    private var token: String?
+    private var apiPrefix = "/api/v1"
+    private var cachedPlaybackSettings: ServerPlaybackSettings?
+    private var playQualityUpdatedAt = Date.distantPast
+
+    init(session: URLSession? = nil) {
+        if let session {
+            self.session = session
+        } else {
+            let configuration = URLSessionConfiguration.default
+            configuration.waitsForConnectivity = true
+            configuration.timeoutIntervalForRequest = 20
+            configuration.timeoutIntervalForResource = 60
+            configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+            self.session = URLSession(configuration: configuration)
+        }
+    }
+
+    func configure(baseURL: String, token: String?, apiPrefix: String? = nil) throws {
+        cachedPlaybackSettings = nil
+        playQualityUpdatedAt = .distantPast
+        let trimmed = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard var components = URLComponents(string: trimmed),
+              let scheme = components.scheme?.lowercased(), ["http", "https"].contains(scheme),
+              components.host != nil else { throw APIError.invalidServer }
+        components.path = components.path.replacingOccurrences(of: "/+$", with: "", options: .regularExpression)
+        guard let url = components.url else { throw APIError.invalidServer }
+        self.baseURL = url
+        self.token = token
+        if let apiPrefix, ["/api", "/api/v1"].contains(apiPrefix) { self.apiPrefix = apiPrefix }
+    }
+
+    func updateToken(_ token: String?) { self.token = token }
+    func selectedAPIPrefix() -> String { apiPrefix }
+
+    func login(username: String, password: String) async throws -> LoginSession {
+        let body: JSONValue = .object([
+            "username": .string(username),
+            "password": .string(password),
+            "remember": .bool(true),
+        ])
+        let root: JSONValue
+        do {
+            root = try await request("/auth/login", method: "POST", body: body, requiresAuth: false)
+        } catch APIError.unauthorized where apiPrefix == "/api/v1" {
+            apiPrefix = "/api"
+            root = try await request("/auth/login", method: "POST", body: body, requiresAuth: false)
+        }
+        guard let object = root.object,
+              let token = object["token"]?.string,
+              let userObject = object["user"]?.object else { throw APIError.invalidResponse }
+        let user = SessionUser(
+            id: userObject.firstString("id") ?? username,
+            username: userObject.firstString("username") ?? username,
+            displayName: userObject.firstString("displayName") ?? username,
+            role: userObject.firstString("role") ?? "user"
+        )
+        self.token = token
+        return LoginSession(token: token, user: user)
+    }
+
+    func currentUser() async throws -> SessionUser {
+        let root: JSONValue
+        do {
+            root = try await request("/auth/me")
+        } catch APIError.unauthorized where apiPrefix == "/api/v1" {
+            apiPrefix = "/api"
+            root = try await request("/auth/me")
+        }
+        let object = root["user"]?.object ?? root["data"]?["user"]?.object ?? root["data"]?.object ?? root.object
+        guard let object else { throw APIError.invalidResponse }
+        return SessionUser(
+            id: object.firstString("id") ?? object.firstString("username") ?? "user",
+            username: object.firstString("username") ?? "user",
+            displayName: object.firstString("displayName") ?? object.firstString("username") ?? "用户",
+            role: object.firstString("role") ?? "user"
+        )
+    }
+
+    func logout() async { _ = try? await request("/auth/logout", method: "POST") }
+
+    func tracks(page: Int = 1, limit: Int = 200, query: String? = nil, sort: String = "mtime") async throws -> [MusicTrack] {
+        var queryItems = [
+            URLQueryItem(name: "page", value: String(page)),
+            URLQueryItem(name: "limit", value: String(limit)),
+            URLQueryItem(name: "sort", value: sort),
+        ]
+        if let query, !query.isEmpty { queryItems.append(URLQueryItem(name: "q", value: query)) }
+        let root = try await request("/library/tracks", query: queryItems)
+        return extractArray(root).compactMap { MusicTrack(json: $0) }
+    }
+
+    func albums(page: Int = 1, query: String? = nil) async throws -> [MusicAlbum] {
+        var items = [URLQueryItem(name: "page", value: String(page))]
+        if let query, !query.isEmpty { items.append(URLQueryItem(name: "q", value: query)) }
+        let values = extractArray(try await request("/library/albums", query: items))
+        return values.compactMap { MusicAlbum(json: $0) }
+    }
+
+    func artists(page: Int = 1, query: String? = nil) async throws -> [MusicArtist] {
+        var items = [URLQueryItem(name: "page", value: String(page))]
+        if let query, !query.isEmpty { items.append(URLQueryItem(name: "q", value: query)) }
+        let values = extractArray(try await request("/library/artists", query: items))
+        return values.compactMap { MusicArtist(json: $0) }
+    }
+
+    func genres() async throws -> [String] {
+        extractArray(try await request("/library/genres")).compactMap { value in
+            value.string ?? value["name"]?.string ?? value["genre"]?.string
+        }
+    }
+
+    func sources() async throws -> [MusicSource] {
+        let root = try await request("/search/sources")
+        guard let object = root["sources"]?.object ?? root["data"]?["sources"]?.object else { return [] }
+        return object.map {
+            MusicSource(id: $0.key, name: $0.value.string ?? $0.value["name"]?.string ?? $0.key)
+        }.sorted { $0.name < $1.name }
+    }
+
+    func searchTracks(keyword: String, source: String, page: Int = 1) async throws -> [MusicTrack] {
+        let root = try await request("/search", query: [
+            URLQueryItem(name: "keyword", value: keyword),
+            URLQueryItem(name: "source", value: source),
+            URLQueryItem(name: "page", value: String(page)),
+            URLQueryItem(name: "limit", value: "40"),
+        ], timeout: 30)
+        return extractArray(root).compactMap { MusicTrack(json: $0, defaultSource: source) }
+    }
+
+    func searchAlbums(keyword: String, source: String, page: Int = 1) async throws -> [MusicAlbum] {
+        let root = try await request("/search/album", query: [
+            URLQueryItem(name: "keyword", value: keyword),
+            URLQueryItem(name: "source", value: source),
+            URLQueryItem(name: "page", value: String(page)),
+            URLQueryItem(name: "limit", value: "30"),
+        ], timeout: 30)
+        return extractArray(root).compactMap { MusicAlbum(json: $0, defaultSource: source) }
+    }
+
+    func searchPlaylists(keyword: String, source: String, page: Int = 1) async throws -> [MusicPlaylist] {
+        let root = try await request("/search/playlist", query: [
+            URLQueryItem(name: "keyword", value: keyword),
+            URLQueryItem(name: "source", value: source),
+            URLQueryItem(name: "page", value: String(page)),
+            URLQueryItem(name: "limit", value: "30"),
+        ], timeout: 30)
+        return extractArray(root).compactMap { MusicPlaylist(json: $0, defaultSource: source) }
+    }
+
+    func newSongs(source: String, region: String = "") async throws -> [MusicTrack] {
+        let root = try await request("/discover/new-songs", query: [
+            URLQueryItem(name: "source", value: source),
+            URLQueryItem(name: "region", value: region),
+            URLQueryItem(name: "page", value: "1"),
+            URLQueryItem(name: "limit", value: "30"),
+        ], timeout: 55)
+        return extractArray(root).compactMap { MusicTrack(json: $0, defaultSource: source) }
+    }
+
+    func newAlbums(source: String, region: String = "") async throws -> [MusicAlbum] {
+        let root = try await request("/discover/new-albums", query: [
+            URLQueryItem(name: "source", value: source),
+            URLQueryItem(name: "region", value: region),
+            URLQueryItem(name: "page", value: "1"),
+            URLQueryItem(name: "limit", value: "20"),
+        ], timeout: 55)
+        return extractArray(root).compactMap { MusicAlbum(json: $0, defaultSource: source) }
+    }
+
+    func toplists(source: String) async throws -> [MusicPlaylist] {
+        let root = try await request("/discover/toplists", query: [URLQueryItem(name: "source", value: source)], timeout: 55)
+        return extractArray(root).compactMap { MusicPlaylist(json: $0, defaultSource: source) }
+    }
+
+    func recommendedPlaylists(source: String) async throws -> [MusicPlaylist] {
+        let root = try await request("/playlist/recommend", query: [
+            URLQueryItem(name: "source", value: source),
+            URLQueryItem(name: "page", value: "1"),
+            URLQueryItem(name: "limit", value: "20"),
+        ], timeout: 30)
+        return extractArray(root).compactMap { MusicPlaylist(json: $0, defaultSource: source) }
+    }
+
+    func collectionTracks(_ collection: OnlineCollection, page: Int = 1) async throws -> TrackPage {
+        let path: String
+        var query = [
+            URLQueryItem(name: "source", value: collection.source),
+            URLQueryItem(name: "page", value: String(page)),
+            URLQueryItem(name: "limit", value: "100"),
+        ]
+        switch collection.kind {
+        case .toplist:
+            path = "/discover/toplist"
+            query.append(URLQueryItem(name: "id", value: collection.id))
+        case .album:
+            path = "/search/album/detail"
+            query.append(URLQueryItem(name: "id", value: collection.id))
+        case .playlist:
+            path = "/playlist"
+            query.append(URLQueryItem(name: "url", value: collection.id))
+        }
+        let root = try await request(path, query: query, timeout: collection.kind == .playlist ? 125 : 55)
+        let data = root["data"] ?? root
+        let tracks = extractArray(root).compactMap { MusicTrack(json: $0, defaultSource: collection.source) }
+        return TrackPage(tracks: tracks, total: data["trackTotal"]?.int ?? data["total"]?.int ?? tracks.count)
+    }
+
+    func userData() async throws -> LibraryUserData {
+        let root = try await request("/library/user-data")
+        let data = root["data"] ?? root
+        guard let object = data.object else { return .empty }
+        let playlists = (object["playlists"]?.array ?? []).compactMap { MusicPlaylist(json: $0) }
+        let favorites = (object["favorites"]?.array ?? []).compactMap { MusicTrack(json: $0) }
+        let recentPlays = (object["recentPlays"]?.array ?? []).compactMap { MusicTrack(json: $0) }
+        return LibraryUserData(playlists: playlists, favorites: favorites, recentPlays: recentPlays, revision: object["revision"]?.int ?? 0)
+    }
+
+    func localCollectionTracks(_ collection: LocalCollection, page: Int) async throws -> TrackPage {
+        var query = [
+            URLQueryItem(name: collection.kind.rawValue, value: collection.value),
+            URLQueryItem(name: "page", value: String(page)),
+            URLQueryItem(name: "limit", value: "200"),
+        ]
+        if collection.kind == .album, let artist = collection.artist, !artist.isEmpty {
+            query.append(URLQueryItem(name: "albumArtist", value: artist))
+        }
+        let root = try await request("/library/tracks", query: query)
+        let tracks = extractArray(root).compactMap { MusicTrack(json: $0) }
+        return TrackPage(tracks: tracks, total: root["total"]?.int ?? tracks.count)
+    }
+
+    func addDownloads(_ tracks: [MusicTrack], quality: NASQuality, batchID: String) async throws -> NASSubmission {
+        guard !tracks.isEmpty, tracks.count <= 50 else { throw APIError.invalidResponse }
+        let result = try await request("/download/add", method: "POST", body: .object([
+            "tasks": .array(tracks.map { $0.downloadPayload(quality: quality, batchID: batchID) }),
+        ]))
+        guard let ids = result["ids"]?.array else { throw APIError.invalidResponse }
+        return NASSubmission(ids: ids.compactMap(\.string), skipped: result["skipped"]?.int ?? 0)
+    }
+
+    func downloadTasks() async throws -> [NASDownloadTask] {
+        extractArray(try await request("/download/list")).compactMap { NASDownloadTask(json: $0) }
+    }
+
+    func audioDownloadRequest(
+        for track: MusicTrack, refresh: Bool = false, quality: String? = nil, smooth: Bool = false
+    ) async throws -> URLRequest {
+        let url = try await resolvePlayURL(for: track, refresh: refresh, quality: quality, smooth: smooth)
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 60
+        if url.scheme == baseURL?.scheme, url.host == baseURL?.host, url.port == baseURL?.port,
+           let token {
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+        return request
+    }
+
+    func saveUserData(_ data: LibraryUserData) async throws {
+        _ = try await request("/library/user-data", method: "PUT", body: .object([
+            "playlists": .array(data.playlists.map(\.json)),
+            "favorites": .array(data.favorites.map(\.snapshotJSON)),
+            "recentPlays": .array(data.recentPlays.map(\.snapshotJSON)),
+            "revision": .number(Double(data.revision)),
+        ]))
+    }
+
+    func serverPlayQuality(force: Bool = false) async throws -> String {
+        let settings = try await serverPlaybackSettings(force: force)
+        return settings.smooth ? "128k" : settings.quality
+    }
+
+    func serverPlaybackSettings(force: Bool = false) async throws -> ServerPlaybackSettings {
+        if !force, let cachedPlaybackSettings, Date().timeIntervalSince(playQualityUpdatedAt) < 60 { return cachedPlaybackSettings }
+        do {
+            let root = try await request("/settings")
+            let data = root["data"] ?? root
+            let raw = data["player.playQuality"]?.string ?? "128k"
+            let allowed = ["128k", "320k", "flac", "flac24bit", "hires", "atmos", "atmos_plus", "master"]
+            let quality = allowed.contains(raw) ? raw : "128k"
+            let smoothValue = data["player.smoothStream"]
+            let smooth = smoothValue == .bool(true) || smoothValue?.string == "true"
+            let settings = ServerPlaybackSettings(quality: quality, smooth: smooth)
+            cachedPlaybackSettings = settings
+            playQualityUpdatedAt = Date()
+            return settings
+        } catch APIError.server(let status, _) where status == 404 {
+            return cachedPlaybackSettings ?? ServerPlaybackSettings()
+        }
+    }
+
+    func resolvePlayURL(
+        for track: MusicTrack, refresh: Bool = false, quality: String? = nil, smooth: Bool = false
+    ) async throws -> URL {
+        var body: [String: JSONValue] = ["refresh": .bool(refresh)]
+        switch track.locator.kind {
+        case .local:
+            if let trackID = track.locator.trackID { body["trackId"] = .string(trackID) }
+            else if let path = track.locator.filePath { body["filePath"] = .string(path) }
+            body["smooth"] = .bool(AudioVariant.usesAAC(for: track, smooth: smooth))
+        case .online:
+            if let songID = track.locator.songID { body["songId"] = .string(songID) }
+            if let source = track.locator.source { body["source"] = .string(source) }
+            let selectedQuality: String
+            if let quality { selectedQuality = quality }
+            else { selectedQuality = try await serverPlayQuality() }
+            body["quality"] = .string(selectedQuality)
+            for (key, value) in track.locator.identifiers { body[key] = .string(value) }
+        }
+        let root = try await request("/play/url", method: "POST", body: .object(body), timeout: 30)
+        guard let rawURL = root["url"]?.string ?? root["data"]?["url"]?.string else { throw APIError.invalidResponse }
+        return try absoluteURL(rawURL)
+    }
+
+    func lyrics(for track: MusicTrack) async throws -> String {
+        var body = track.snapshotJSON.object ?? [:]
+        if let source = track.locator.source { body["source"] = .string(source) }
+        body["preferWords"] = .bool(true)
+        let root = try await request("/play/lyric", method: "POST", body: .object(body), timeout: 30)
+        let data = root["data"] ?? root
+        let wordTimed = data["ylyric"]?.string ?? ""
+        return wordTimed.isEmpty ? (data["lyric"]?.string ?? "") : wordTimed
+    }
+
+    func coverData(for track: MusicTrack) async throws -> Data? {
+        try Task.checkCancellation()
+        if let direct = track.artworkURL, let result = await remoteCoverData(direct) {
+            return result
+        }
+        try Task.checkCancellation()
+        if let path = track.locator.filePath,
+           let embedded = try? await data(path: "/tag/cover", query: [URLQueryItem(name: "path", value: path)]),
+           Self.isImage(embedded) {
+            return embedded
+        }
+        try Task.checkCancellation()
+        var body = track.snapshotJSON.object ?? [:]
+        body["coverFallback"] = .bool(track.artworkURL != nil)
+        let root = try await request("/play/cover", method: "POST", body: .object(body))
+        guard let raw = root["url"]?.string ?? root["data"]?["url"]?.string,
+              !raw.isEmpty, raw != track.artworkURL else { return nil }
+        return await remoteCoverData(raw)
+    }
+
+    func remoteCoverData(_ raw: String) async -> Data? {
+        guard !Task.isCancelled else { return nil }
+        if raw.hasPrefix("data:image/") {
+            let parts = raw.split(separator: ",", maxSplits: 1)
+            guard parts.count == 2, parts[0].hasSuffix(";base64"),
+                  let decoded = Data(base64Encoded: String(parts[1])), Self.isImage(decoded) else { return nil }
+            return decoded
+        }
+        guard let url = try? absoluteURL(raw), ["http", "https"].contains(url.scheme?.lowercased() ?? "") else { return nil }
+        var candidates = [url]
+        if url.scheme == "http", var secure = URLComponents(url: url, resolvingAgainstBaseURL: false) {
+            secure.scheme = "https"
+            if let secureURL = secure.url { candidates.insert(secureURL, at: 0) }
+        }
+        for candidate in candidates {
+            guard !Task.isCancelled else { return nil }
+            var request = URLRequest(url: candidate)
+            request.timeoutInterval = 8
+            if candidate.scheme == baseURL?.scheme, candidate.host == baseURL?.host, candidate.port == baseURL?.port, let token {
+                request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+            }
+            if let (bytes, response) = try? await session.data(for: request),
+               (response as? HTTPURLResponse)?.statusCode == 200, Self.isImage(bytes) {
+                return bytes
+            }
+        }
+        guard !Task.isCancelled else { return nil }
+        if let bytes = try? await data(path: "/play/cover-img", query: [
+            URLQueryItem(name: "url", value: url.absoluteString), URLQueryItem(name: "w", value: "500"),
+        ]), Self.isImage(bytes) { return bytes }
+        return nil
+    }
+
+    private nonisolated static func isImage(_ data: Data) -> Bool {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return false }
+        return CGImageSourceGetCount(source) > 0
+    }
+
+    func webSocketURL() throws -> URL {
+        guard let baseURL else { throw APIError.invalidServer }
+        var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false)
+        components?.scheme = baseURL.scheme == "https" ? "wss" : "ws"
+        components?.path = "/ws"
+        components?.queryItems = token.map { [URLQueryItem(name: "token", value: $0)] }
+        guard let url = components?.url else { throw APIError.invalidServer }
+        return url
+    }
+
+    private func request(
+        _ path: String,
+        method: String = "GET",
+        query: [URLQueryItem] = [],
+        body: JSONValue? = nil,
+        requiresAuth: Bool = true,
+        timeout: TimeInterval? = nil
+    ) async throws -> JSONValue {
+        let request = try makeRequest(path, method: method, query: query, body: body, requiresAuth: requiresAuth, timeout: timeout)
+        let attempts = method == "GET" ? 2 : 1
+        var lastError: Error?
+        for attempt in 0..<attempts {
+            do {
+                let (data, response) = try await session.data(for: request)
+                guard let http = response as? HTTPURLResponse else { throw APIError.invalidResponse }
+                let json = (try? JSONDecoder().decode(JSONValue.self, from: data)) ?? .object([:])
+                if http.statusCode == 401 { throw APIError.unauthorized }
+                guard (200..<300).contains(http.statusCode) else {
+                    let message = json["error"]?.string ?? "请求失败（\(http.statusCode)）"
+                    throw APIError.server(status: http.statusCode, message: message)
+                }
+                return json
+            } catch is CancellationError { throw CancellationError() }
+            catch let error as APIError { throw error }
+            catch {
+                lastError = error
+                guard attempt + 1 < attempts else { break }
+                try? await Task.sleep(for: .milliseconds(300))
+            }
+        }
+        throw lastError ?? APIError.invalidResponse
+    }
+
+    private func data(path: String, query: [URLQueryItem]) async throws -> Data? {
+        let request = try makeRequest(path, method: "GET", query: query, body: nil, requiresAuth: true, timeout: 30)
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else { throw APIError.invalidResponse }
+        if http.statusCode == 404 { return nil }
+        if http.statusCode == 401 { throw APIError.unauthorized }
+        guard (200..<300).contains(http.statusCode) else { throw APIError.server(status: http.statusCode, message: "资源加载失败") }
+        return data
+    }
+
+    private func makeRequest(
+        _ path: String,
+        method: String,
+        query: [URLQueryItem],
+        body: JSONValue?,
+        requiresAuth: Bool,
+        timeout: TimeInterval?
+    ) throws -> URLRequest {
+        guard let baseURL else { throw APIError.invalidServer }
+        var url = baseURL
+        for component in apiPrefix.split(separator: "/") { url.appendPathComponent(String(component)) }
+        for component in path.split(separator: "/") { url.appendPathComponent(String(component)) }
+        var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        components?.queryItems = query.isEmpty ? nil : query
+        guard let finalURL = components?.url else { throw APIError.invalidServer }
+        var request = URLRequest(url: finalURL)
+        request.httpMethod = method
+        request.timeoutInterval = timeout ?? 20
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        if requiresAuth, let token { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
+        if let body {
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = try JSONEncoder().encode(body)
+        }
+        return request
+    }
+
+    private func absoluteURL(_ raw: String) throws -> URL {
+        if let url = URL(string: raw), url.scheme != nil { return url }
+        guard let baseURL, let url = URL(string: raw, relativeTo: baseURL)?.absoluteURL else { throw APIError.invalidResponse }
+        return url
+    }
+
+    private func extractArray(_ root: JSONValue) -> [JSONValue] {
+        if let array = root.array { return array }
+        if let data = root["data"] {
+            if let array = data.array { return array }
+            if let object = data.object {
+                for key in ["list", "items", "songs", "tracks", "albums", "artists", "playlists", "data"] {
+                    if let array = object[key]?.array { return array }
+                }
+            }
+        }
+        if let object = root.object {
+            for key in ["list", "items", "songs", "tracks", "albums", "artists", "playlists"] {
+                if let array = object[key]?.array { return array }
+            }
+        }
+        return []
+    }
+}
